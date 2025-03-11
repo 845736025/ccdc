@@ -1,0 +1,297 @@
+import os
+from os.path import join, exists
+from typing import Any, Tuple
+import logging
+import time
+import yaml
+import datetime
+import click
+import requests
+import pandas as pd
+import numpy as np
+# from db import SqlConnector
+import sqlite3
+from pathlib import Path
+from logging import Logger
+
+
+s2_stack_bands = ["B02", "B03", "B04", "B8A", "B11", "B12", "Fmask"]
+l8_stack_bands = ["B02", "B03", "B04", "B05", "B06", "B07", "Fmask"]
+QA_CLEAR = 0
+QA_WATER = 1
+QA_SHADOW = 2
+QA_SNOW = 3
+QA_CLOUD = 4
+QA_FILL = 255
+VERSION = "v2.0"
+SEARCH_BLOCK_SIZE = 50
+TOTAL_FILE_COUNT = 0
+FILE_COUNT = 0
+
+class DownloadFailError(Exception):
+    """Custon error for DB selection error"""
+
+    def __init__(self, message: str, file_name: str, url: str) -> None:
+        self.message = message
+        self.file_name = file_name
+        self.url = url
+        super().__init__(message)
+
+def search_hls_item(
+    targeted_tile, minx, miny, maxx, maxy, low_date_block, upper_date_block, lp_search
+):
+    """
+    :param targeted_tile:
+    :param centerx:
+    :param centery:P
+    :param low_date_block:
+    :param upper_date_block: not included
+    :return:
+    """
+    params = {}
+    params["limit"] = SEARCH_BLOCK_SIZE  # Add in a limit parameter to retrieve 100 items at a time.
+    pd.Timestamp.fromordinal(low_date_block)
+
+    # Define start time period / end time period
+    params[
+        "datetime"
+    ] = f"{pd.Timestamp.fromordinal(low_date_block).strftime('%Y-%m-%d')}/{pd.Timestamp.fromordinal(upper_date_block).strftime('%Y-%m-%d')}"
+    params["collections"] = [f"HLSL30.{VERSION}", f"HLSS30.{VERSION}"]
+    params["bbox"] = f"{minx},{miny},{maxx},{maxy}"
+    # Send POST request with S30 and L30 collections included
+    hls_items = requests.post(lp_search, json=params, timeout=60).json()["features"]
+    hls_items = [
+        hls_items[i] for i in range(len(hls_items)) if hls_items[i]["id"].find(targeted_tile) != -1
+    ]
+    return hls_items
+
+
+def download_url(url, out_dir, attempt_num=1):
+    """
+    :param url: the downloading url
+    :param out_dir: the place to save images
+    :param attempt_num: maximum attempt_num
+    :return:
+    """
+    try:
+        # Using HEAD command to save on bandwidth (as we won't need the body if we are skipping it!)
+        api_key = "eyJ0eXAiOiJKV1QiLCJvcmlnaW4iOiJFYXJ0aGRhdGEgTG9naW4iLCJzaWciOiJlZGxqd3RwdWJrZXlfb3BzIiwiYWxnIjoiUlMyNTYifQ.eyJ0eXBlIjoiVXNlciIsInVpZCI6ImxyaHJzaXQ1NzciLCJleHAiOjE3MzgyNDg1NDEsImlhdCI6MTczMzA2NDU0MSwiaXNzIjoiaHR0cHM6Ly91cnMuZWFydGhkYXRhLm5hc2EuZ292IiwiaWRlbnRpdHlfcHJvdmlkZXIiOiJlZGxfb3BzIiwiYXNzdXJhbmNlX2xldmVsIjoyfQ.JPdW51eZZRU3Ygq1WGZrUlyGF1pUKnY33xRVId9zmZj_uhHsaXblCKiGAVEfKK1YNemnXw_Vj_LzNjuZbZhoDt9InFT8SM_v39JXtsFqYxKEGZudilDeLHCNBsx5P2R90PVtpi3Niz_VewffNHr1z0sP2XB95mCM8Ztw4sJZt9He8m7x_4xDnMNepjHLCgG19qKi0N65nhd9m9WJWiWDKGtjhQaPApO_ILWoKkUG5LAOP8IP_hP7QfXzWQuwXfzjr6Ns0kiAptCg7zbfbWMVa-EU-ziotZjqHgXzpE1QkUxY4u843O4dKARIhTLg2EYS490h3nCNOHl0FFyIvOvg2A"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        resp = requests.Session().get(
+            url, stream=True, headers=headers, allow_redirects=True
+        )
+        print(resp)
+        resp.raise_for_status()  # raise an HTTPError, if the response was an http error.
+        # resp = requests.head(url, stream=True, allow_redirects=True)
+        # print(resp.raise_for_status() )
+        file_path = join(out_dir, "".join(url.rsplit("/")[-1]))
+        if not os.path.isfile(file_path):
+            open(file_path, "wb").write(resp.content)
+
+        exist_size = os.path.getsize(file_path)
+        if int(resp.headers["Content-Length"]) > exist_size:  # double check the downloaded size.
+            # logger.info("Only partial content to be downloaded #%d to download %s. Will attempt \
+            #     to retry in 10 seconds...", (attempt_num, filename if filename else "from " + url))
+            if attempt_num < 3:
+                time.sleep(10)
+                download_url(url, out_dir, attempt_num + 1)
+            else:
+                # logger.warning("Failed three times to download from %s. Giving up on it", url)
+                return
+
+    # except (requests.exceptions.HTTPError, requests.exceptions.ChunkedEncodingError) as err:
+    except:
+        # logger.warning("An error ('%s') occurred while downloading from %s: %s",
+        #                (str(type(err)), url, str(err)), exc_info=True)
+        if attempt_num < 3:
+            # logger.warning("Failed attempt #%d to download %s. Will attempt to retry "
+            #                "in 30 seconds...", (attempt_num, filename if filename else "from " + url))
+            time.sleep(30)
+            download_url(url, out_dir, attempt_num + 1)
+        else:
+            raise DownloadFailError(
+                message="Failed three times to download.Giving up on it",
+                file_name="".join(url.rsplit("/")[-1]),
+                url=url,
+            )
+# TODO: difficult to decide hls dictionary type, put any as an ugly solution
+def _download_hls_item_cmr(hls_item: Any, out_path: str) -> None:
+    stack_band_links = []
+    if hls_item["producer_granule_id"].split(".")[1] == "L30":
+        stack_bands = l8_stack_bands
+    elif hls_item["producer_granule_id"].split(".")[1] == "S30":
+        stack_bands = s2_stack_bands
+    else:
+        return
+
+    for link in hls_item["links"]:
+        split_terms = link["href"].split("/")
+        if len(split_terms) >= 5 and split_terms[0] == "https:":
+            if split_terms[4].split(".")[0] == "HLSL30" or split_terms[4].split(".")[0] == "HLSS30":
+                stack_band_links.append(link["href"])
+            # print(link['href'])
+
+    for url in stack_band_links:
+        try:
+            if url.split(".")[-2] == stack_bands[0]:  # blue index
+                download_url(url, join(out_path, hls_item["title"]))
+            elif url.rsplit(".")[-2] == stack_bands[1]:  # green index
+                download_url(url, join(out_path, hls_item["title"]))
+            elif url.rsplit(".")[-2] == stack_bands[2]:  # red index
+                download_url(url, join(out_path, hls_item["title"]))
+            elif url.rsplit(".")[-2] == stack_bands[3]:  # NIR index
+                download_url(url, join(out_path, hls_item["title"]))
+            elif url.rsplit(".")[-2] == stack_bands[4]:  # SWIR1 index
+                download_url(url, join(out_path, hls_item["title"]))
+            elif url.rsplit(".")[-2] == stack_bands[5]:  # SWIR2 index
+                download_url(url, join(out_path, hls_item["title"]))
+            elif url.rsplit(".")[-2] == stack_bands[6]:  # Fmask index
+                download_url(url, join(out_path, hls_item["title"]))
+        except DownloadFailError as err:
+            raise err
+
+
+def hls_download_cmr(
+    tile_name: str, low_date_bound: str, upper_date_bound: str, out_path: str, logger: Logger
+) -> list:
+    """_summary_
+
+    Args:
+        tile_name (str): _description_
+        low_date_bound (str): inclusion
+        upper_date_bound (str): inclusion
+        out_path (str): _description_
+        logger: Logger
+
+    Raises:
+        err: DownloadFailError
+
+    Returns:
+        list: _description_
+    """
+
+    query_link = "https://cmr.earthdata.nasa.gov/search/granules.json?collection_concept_id=C2021957295-LPCLOUD&collection_concept_id=C2021957657-LPCLOUD&page_size=2000"
+    query = f"{query_link}&temporal={low_date_bound}T00:00:00Z,{upper_date_bound}T23:59:59Z&attribute[]=string,MGRS_TILE_ID,{tile_name}"
+    hls_item_collected = None
+    while hls_item_collected is None:
+        try:
+            hls_item_collected = requests.get(query, timeout=60).json()
+            break
+        except:
+            time.sleep(5)
+            continue
+    # hls_item_collected = requests.get(query, timeout=60).json()
+    Path(out_path).mkdir(exist_ok=True)
+
+    id_list = [item["title"] for item in hls_item_collected["feed"]["entry"]]
+    for index in id_list:
+        if not exists(join(out_path, index)):
+            Path(join(out_path, index)).mkdir(exist_ok=True)
+
+    ret = []
+    # we don't do downloading in parallel
+    for item in hls_item_collected["feed"]["entry"]:
+        try:
+            _download_hls_item_cmr(item, out_path)
+        except DownloadFailError as err:
+            # logger.error('downloading fails for %s: %s', (item['title'], err))
+            logger.warning("download fails for tile=%s, url = %s ", err.file_name, err.url)
+            ret.append((item["title"], "F"))
+            # raise err
+        else:
+            ret.append((item["title"], "S"))
+    return ret
+
+
+# def inputdb_download_results(
+#     download_results: list, db_connector: SqlConnector, tile_name: str, epoch_id: int
+# ) -> None:
+#     """insert download results into the database
+
+#     Args:
+#         download_results (list): _description_
+#         db_connector (SqlConnector): _description_
+#         tile_name (str): _description_
+#         epoch_id (int): _description_
+
+#     Returns:
+#         list: _description_
+#     """
+#     for ret in download_results:
+#         db_connector.insert_image_list(ret[0], tile_name, epoch_id, ret[1])
+
+
+# def readdb_download_info(
+#     db_connector: SqlConnector, tile_name: str, epoch_id: int, epoch_start: str
+# ) -> Tuple[int, int, str]:
+#     """read download results from db
+#     Args:
+#         db_connector (SqlConnector): database connector
+#         tile_name (str): tile name
+#         epoch_id (int): epoch id
+#         epoch_start (str): the starting date of epich
+
+#     Returns: (len(success_scene), len(total_scene), epoch_end_real)
+#     """
+#     total_scene = db_connector.fetch_image_scene(tile_name, epoch_id)
+#     success_scene = db_connector.fetch_image_scene(tile_name, epoch_id, success_only=True)
+#     if len(success_scene) > 0:
+#         success_scene_dates = [scene[0].split(".")[3][0:7] for scene in success_scene]
+#         success_scene_dates.sort()
+#         epoch_end_real = (
+#             datetime.datetime(int(success_scene_dates[-1][0:4]), 1, 1)
+#             + datetime.timedelta(int(success_scene_dates[-1][4:7]) - 1)
+#         ).strftime("%Y-%m-%d")
+#     else:
+#         epoch_end_real = epoch_start
+#     return len(success_scene), len(total_scene), epoch_end_real
+
+
+@click.command()
+@click.option(
+    "--tile_list_fn", type=str, default=r"C:\Users\DELL\PycharmProjects\RSpythonProject\YeSir\tile_list.txt"
+)
+@click.option(
+    "--out_path", type=str, default=r"C:\Users\DELL\PycharmProjects\RSpythonProject\YeSir\Output", help="the folder to save files"
+)
+@click.option(
+    "--yaml_path",
+    type=str,
+    help="yaml file path for configuration",
+    default=r"C:\Users\DELL\PycharmProjects\RSpythonProject\YeSir\config_hls.yaml",
+)
+@click.option("--rank", type=int, default=1, help="the rank id")
+@click.option("--n_cores", type=int, default=1, help="the total cores assigned")
+
+def main(tile_list_fn, out_path, yaml_path, rank, n_cores):
+    with open(yaml_path, encoding="utf-8") as yaml_obj:
+        config = yaml.safe_load(yaml_obj)
+
+    with open(tile_list_fn, encoding="utf-8") as f:
+        tile_list = [line.rstrip() for line in f]
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=" %(asctime)s | %(levelname)s | %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+        ],
+    )
+    logger = logging.getLogger(__name__)
+
+    nblock_eachcore = int(np.ceil(len(tile_list) / n_cores))
+    for i in range(nblock_eachcore):
+        tile_id = n_cores * i + rank - 1
+        if tile_id > (len(tile_list) - 1):
+            break
+
+        download_results = hls_download_cmr(
+            tile_list[tile_id],
+            str(config["OFFLINECONFIG"]["hls14_max_date"]),
+            str(config["OFFLINECONFIG"]["epoch0_end"]),
+            join(out_path, tile_list[tile_id]),
+            # logger=logger,
+        )
+
+if __name__ == "__main__":
+    main()
